@@ -191,8 +191,8 @@ class Agente:
 def main():
     import tkinter as tk
     from pathlib import Path
-    from tkinter import filedialog, messagebox, ttk
-    from PIL import Image, ImageChops, ImageEnhance, ImageOps, ImageTk
+    from tkinter import ttk
+    from PIL import Image, ImageEnhance, ImageOps, ImageTk
 
     root = tk.Tk()
     root.title("Wumpus | Agente lógico")
@@ -216,20 +216,26 @@ def main():
 
     estado = {"mundo": Mundo(), "agente": None, "automatico": False}
     mostrar_mundo = tk.BooleanVar(value=False)
+    assets_dir = Path(__file__).with_name("Imgs Wumpus")
     background_source = None
     logo_source = None
-    for filename, kind in (("fondo_cueva.jpg", "background"),
-                           ("escudo_universidad.png", "logo")):
-        path = Path(__file__).with_name(filename)
-        if path.exists():
-            try:
-                with Image.open(path) as image:
-                    if kind == "background":
-                        background_source = image.convert("RGB")
-                    else:
-                        logo_source = image.convert("RGBA")
-            except OSError:
-                pass
+    try:
+        with Image.open(assets_dir / "Fondo juego.jpg") as image:
+            background_source = image.convert("RGB")
+    except OSError:
+        pass
+    try:
+        with Image.open(assets_dir / "logo universidad.png") as image:
+            logo_source = image.convert("RGBA")
+    except OSError:
+        pass
+    wumpus_logo_source = None
+    try:
+        with Image.open(assets_dir / "LOGO WUMPUS.png") as image:
+            wumpus_logo_source = image.convert("RGBA")
+    except OSError:
+        pass
+    sprite_cache = {}
     background_cache = {}
 
     home = tk.Frame(root, bg="#0b141b")
@@ -246,7 +252,7 @@ def main():
                       padx=12, pady=10, relief="flat", state="disabled")
     scrollbar = ttk.Scrollbar(game_canvas, orient="vertical", command=history.yview)
     history.configure(yscrollcommand=scrollbar.set)
-    logo_photo = {"image": None}
+    logo_photos = {"university": None, "wumpus": None}
 
     def background_photo(size):
         if size not in background_cache:
@@ -262,6 +268,19 @@ def main():
             background_cache[size] = ImageTk.PhotoImage(image)
         return background_cache[size]
 
+    def sprite_photo(filename, size, fit=False):
+        key = (filename, size, fit)
+        if key not in sprite_cache:
+            path = assets_dir / filename
+            with Image.open(path) as image:
+                sprite = image.convert("RGBA")
+            if fit:
+                sprite = ImageOps.fit(sprite, size, method=Image.Resampling.LANCZOS)
+            else:
+                sprite.thumbnail(size, Image.Resampling.LANCZOS)
+            sprite_cache[key] = ImageTk.PhotoImage(sprite)
+        return sprite_cache[key]
+
     def draw_home():
         width = max(home_canvas.winfo_width(), 980)
         height = max(home_canvas.winfo_height(), 720)
@@ -275,15 +294,24 @@ def main():
         home_canvas.create_text(58, 46, anchor="nw", text="WUMPUS  /  AGENTE LÓGICO",
                                 font=("Segoe UI Semibold", 12), fill="#e3bd72",
                                 tags="scene")
-        home_canvas.create_text(width - 58, 48, anchor="ne", text="PROYECTO ACADÉMICO",
-                                font=("Segoe UI", 9), fill="#a7b5b5", tags="scene")
+        if logo_source is not None:
+            home_canvas.create_rectangle(width - 360, 28, width - 42, 86,
+                                         fill="#f7f5ef", outline="#d7d0c2",
+                                         tags="scene")
+            university_logo = ImageOps.contain(
+                logo_source, (300, 54), method=Image.Resampling.LANCZOS,
+            )
+            logo_photos["university"] = ImageTk.PhotoImage(university_logo)
+            home_canvas.create_image(width - 201, 57,
+                                     image=logo_photos["university"], tags="scene")
 
         logo_x, logo_y = width * 0.25, height * 0.48
-        if logo_source is not None:
-            logo = ImageOps.contain(logo_source, (300, 340),
-                                    method=Image.Resampling.LANCZOS)
-            logo_photo["image"] = ImageTk.PhotoImage(logo)
-            home_canvas.create_image(logo_x, logo_y, image=logo_photo["image"],
+        if wumpus_logo_source is not None:
+            wumpus_logo = ImageOps.contain(
+                wumpus_logo_source, (300, 340), method=Image.Resampling.LANCZOS,
+            )
+            logo_photos["wumpus"] = ImageTk.PhotoImage(wumpus_logo)
+            home_canvas.create_image(logo_x, logo_y, image=logo_photos["wumpus"],
                                      tags="scene")
         else:
             home_canvas.create_oval(logo_x - 112, logo_y - 112, logo_x + 112,
@@ -332,8 +360,6 @@ def main():
                                 justify="left", tags="scene")
         home_canvas.coords(play_window, width * 0.64, height * 0.82)
         home_canvas.coords(exit_window, width * 0.82, height * 0.82)
-        home_canvas.coords(background_window, width - 178, 57)
-        home_canvas.coords(logo_window, width - 64, 57)
 
     def draw_game():
         width = max(game_canvas.winfo_width(), 980)
@@ -367,9 +393,9 @@ def main():
                                     fill="#e5c276" if index == 0 else "#e1e8e7",
                                     tags="scene")
 
-        board_size = min(height - 320, width * 0.48, 560)
+        cell_size = max(88, min(140, (height - 320) / N, (width * 0.48) / N))
+        board_size = cell_size * N
         board_x, board_y = 46, 218
-        cell_size = board_size / N
         game_canvas.create_text(board_x, board_y - 31, anchor="nw",
                                 text="MAPA DE EXPLORACIÓN",
                                 font=("Segoe UI Semibold", 11), fill="#e7ece8",
@@ -380,20 +406,27 @@ def main():
                                      outline="#465961", tags="scene")
         pits, possible_pits, possible_wumpus, certain_wumpus = agent.inferir()
         reveal = mostrar_mundo.get() or agent.fin or not agent.vivo
+        floor_sprites = (
+            "Casilla 1.png",
+            "casilla 2 medio quebrada.png",
+            "cadilla 3 llena de musgo y quebrada.png",
+            "casilla 4 llena de musgo.png",
+            "hoyo escondido.png",
+        )
         for row, y in enumerate(range(N, 0, -1)):
             for column, x in enumerate(range(1, N + 1)):
                 cell = (x, y)
                 left, top = board_x + column * cell_size, board_y + row * cell_size
                 right, bottom = left + cell_size, top + cell_size
                 if cell in agent.visitadas:
-                    fill, outline, label = "#1b3941", "#45636b", "VISITADA"
+                    outline, label = "#6d9290", "VISITADA"
                 elif agent.segura(cell):
-                    fill, outline, label = "#17483e", "#4e8978", "SEGURA"
+                    outline, label = "#73a88f", "SEGURA"
                 elif cell in pits or cell == certain_wumpus:
-                    fill, outline = "#563437", "#a66a61"
+                    outline = "#ce7166"
                     label = "HOYO" if cell in pits else "WUMPUS"
                 elif cell in possible_pits or cell in possible_wumpus:
-                    fill, outline = "#4b422f", "#9b8350"
+                    outline = "#d1ad62"
                     hints = []
                     if cell in possible_pits:
                         hints.append("HOYO?")
@@ -401,29 +434,64 @@ def main():
                         hints.append("WUMPUS?")
                     label = " / ".join(hints)
                 else:
-                    fill, outline, label = "#17252d", "#354850", "SIN EXPLORAR"
-                if cell == agent.pos:
-                    fill, outline, label = "#6e542b", "#edc777", "AGENTE"
+                    outline, label = "#354850", ""
+
+                sprite = None
                 if reveal:
                     if cell in world.hoyos:
+                        sprite = "hoyo revelado.png"
                         label = "HOYO"
                     elif cell == world.wumpus:
+                        sprite = "wumpus revelado.png"
                         label = "WUMPUS"
-                    elif cell == world.oro:
+                    elif cell == world.oro and cell in agent.visitadas:
+                        sprite = "cofre brillante.png"
                         label = "ORO"
-                    if cell == agent.pos:
-                        label = "AGENTE\n" + label
+                elif cell in pits:
+                    sprite, label = "hoyo revelado.png", "HOYO"
+                elif cell == certain_wumpus:
+                    sprite, label = "wumpus escondido.png", "WUMPUS?"
+                elif cell in possible_wumpus:
+                    sprite, label = "wumpus escondido.png", "W?"
+
+                if cell == world.oro and (reveal or cell in agent.visitadas):
+                    sprite, label = "cofre brillante.png", "ORO"
+
+                tile = floor_sprites[(x + 2 * y) % len(floor_sprites)]
+                tile_photo = sprite_photo(tile, (int(cell_size - 6), int(cell_size - 6)), fit=True)
+                game_canvas.create_image((left + right) / 2, (top + bottom) / 2,
+                                         image=tile_photo, tags="scene")
                 game_canvas.create_rectangle(left + 3, top + 3, right - 3, bottom - 3,
-                                             fill=fill, outline=outline,
-                                             width=2 if cell == agent.pos else 1,
+                                             fill="", outline=outline,
+                                             width=3 if cell == agent.pos else 2,
                                              tags="scene")
                 game_canvas.create_text(left + 11, top + 9, anchor="nw",
                                         text=f"{x}, {y}", font=("Segoe UI", 8),
                                         fill="#a6b5b5", tags="scene")
-                game_canvas.create_text((left + right) / 2, (top + bottom) / 2 + 5,
-                                        text=label, font=("Segoe UI Semibold", 10),
-                                        fill="#f0eadb", width=cell_size - 14,
-                                        tags="scene")
+                if sprite:
+                    icon_size = int(cell_size * 0.65)
+                    icon = sprite_photo(sprite, (icon_size, icon_size))
+                    game_canvas.create_image((left + right) / 2,
+                                             (top + bottom) / 2 - 5,
+                                             image=icon, tags="scene")
+                if cell == agent.pos:
+                    explorer_size = int(cell_size * 0.52)
+                    explorer = sprite_photo("explorador.png",
+                                            (explorer_size, explorer_size))
+                    game_canvas.create_image((left + right) / 2,
+                                             (top + bottom) / 2 - 5,
+                                             image=explorer, tags="scene")
+                    label = "AGENTE" if not label else "AGENTE / " + label
+                if label:
+                    game_canvas.create_rectangle(left + 7, bottom - 22,
+                                                 right - 7, bottom - 4,
+                                                 fill="#101a21", outline="",
+                                                 tags="scene")
+                    game_canvas.create_text((left + right) / 2, bottom - 13,
+                                            text=label,
+                                            font=("Segoe UI Semibold", 8),
+                                            fill="#f0eadb", width=cell_size - 16,
+                                            tags="scene")
 
         sidebar_x = board_x + board_size + 38
         sidebar_width = width - sidebar_x - 40
@@ -516,64 +584,12 @@ def main():
         home.lift()
         draw_home()
 
-    def choose_background():
-        nonlocal background_source
-        path = filedialog.askopenfilename(
-            parent=root, title="Elegir fondo de la cueva",
-            filetypes=[("Imágenes", "*.jpg *.jpeg *.png"), ("Todos los archivos", "*.*")],
-        )
-        if not path:
-            return
-        try:
-            with Image.open(path) as image:
-                background_source = image.convert("RGB")
-        except OSError as error:
-            messagebox.showerror("No se pudo abrir la imagen", str(error), parent=root)
-            return
-        background_cache.clear()
-        draw_home()
-        draw_game()
-
-    def choose_logo():
-        nonlocal logo_source
-        path = filedialog.askopenfilename(
-            parent=root, title="Elegir escudo del equipo",
-            filetypes=[("Imágenes", "*.png *.jpg *.jpeg"), ("Todos los archivos", "*.*")],
-        )
-        if not path:
-            return
-        try:
-            with Image.open(path) as image:
-                logo_source = image.convert("RGBA")
-                if image.mode == "RGBA" and image.getchannel("A").getextrema()[0] < 255:
-                    bounds = logo_source.getchannel("A").getbbox()
-                else:
-                    rgb = logo_source.convert("RGB")
-                    difference = ImageChops.difference(
-                        rgb, Image.new("RGB", rgb.size, "black"),
-                    ).convert("L")
-                    bounds = difference.point(lambda value: 255 if value > 24 else 0).getbbox()
-                if bounds:
-                    logo_source = logo_source.crop(bounds)
-        except OSError as error:
-            messagebox.showerror("No se pudo abrir el escudo", str(error), parent=root)
-            return
-        draw_home()
-
     play_button = ttk.Button(home_canvas, text="JUGAR", style="Wumpus.Primary.TButton",
                              command=start_game)
     exit_button = ttk.Button(home_canvas, text="SALIR", style="Wumpus.Secondary.TButton",
                              command=root.destroy)
-    background_button = ttk.Button(home_canvas, text="Fondo",
-                                   style="Wumpus.Secondary.TButton",
-                                   command=choose_background)
-    logo_button = ttk.Button(home_canvas, text="Escudo",
-                             style="Wumpus.Secondary.TButton", command=choose_logo)
     play_window = home_canvas.create_window(0, 0, window=play_button, width=190, height=52)
     exit_window = home_canvas.create_window(0, 0, window=exit_button, width=130, height=52)
-    background_window = home_canvas.create_window(0, 0, window=background_button,
-                                                  width=78, height=34)
-    logo_window = home_canvas.create_window(0, 0, window=logo_button, width=78, height=34)
 
     auto_button = ttk.Button(game_canvas, text="Automático",
                              style="Wumpus.Secondary.TButton", command=toggle_auto)
