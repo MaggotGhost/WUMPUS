@@ -1,4 +1,32 @@
-"""Wumpus: agente logico y simulador grafico."""
+"""Wumpus: agente logico (lógica proposicional) y simulador grafico.
+
+Como razona el agente (lo visto en clase)
+-----------------------------------------
+* Simbolos proposicionales: P[x,y] = "hay un hoyo en (x,y)"
+                            W[x,y] = "hay un Wumpus en (x,y)"
+* Reglas del mundo (bicondicionales):
+      B[x,y] <=> P[vecina1] v P[vecina2] v ...     (brisa)
+      S[x,y] <=> W[vecina1] v W[vecina2] v ...     (hedor)
+* Observaciones: lo que el agente percibe en cada casilla visitada (TELL).
+* KB = reglas + observaciones.
+* Modelos: se enumeran TODAS las asignaciones de verdad (tabla de verdad,
+  2^n filas) y se conservan solo las que hacen verdadera la KB.
+* Consecuencia logica (KB |= alfa): alfa es verdadera en TODOS los modelos
+  de la KB. Una casilla es segura si la KB implica "no hay hoyo ni Wumpus".
+* Si alfa es falsa en al menos un modelo, KB no implica alfa: la casilla es
+  solo "posible" (incierta).
+
+El BFS se usa unicamente como planificador de ruta: una vez la KB decide
+cuales casillas son seguras, calcula el camino mas corto por ellas.
+
+Bitacora
+--------
+Tiene dos niveles:
+* Normal (por defecto): una linea por accion (movimiento + percepcion,
+  disparo, grito, oro). Pensada para quien juega.
+* Razonamiento (KB): ademas muestra los modelos y las inferencias
+  (KB |= seguras: ...). Se activa con la casilla "Ver razonamiento (KB)".
+"""
 
 ##HECHO POR
 ##PAULA ROMERO
@@ -7,14 +35,36 @@
 
 import random
 from collections import deque
+from itertools import product
 
 N = 4
+NOMBRES_PERCEPCION = ("Hedor", "Brisa", "Brillo", "Golpe", "Grito")
 
 
 def vecinos(c):
     x, y = c
     return [(a, b) for a, b in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1))
             if 1 <= a <= N and 1 <= b <= N]
+
+
+def signo(n):
+    return (n > 0) - (n < 0)
+
+
+def alineados(a, b):
+    """True si dos casillas comparten fila o columna (se puede disparar)."""
+    return a[0] == b[0] or a[1] == b[1]
+
+
+def coord(c):
+    """Formato compacto para la bitacora: (3,2)."""
+    return f"({c[0]},{c[1]})"
+
+
+def texto_percepcion(p):
+    """[Hedor, Brisa, Brillo, Golpe, Grito] -> 'Brisa + Hedor' o 'Sin señales'."""
+    activas = [n for n, v in zip(NOMBRES_PERCEPCION, p) if v]
+    return " + ".join(activas) if activas else "Sin señales"
 
 
 class Mundo:
@@ -25,18 +75,38 @@ class Mundo:
         if aleatorio:
             libres = [(x, y) for x in range(1, N + 1) for y in range(1, N + 1)
                       if (x, y) != (1, 1)]
-            self.wumpus, self.oro = random.sample(libres, 2)
-            self.hoyos = {c for c in libres if c not in (self.wumpus, self.oro)
-                          and random.random() < 0.2}
+            # Se regenera hasta que el oro sea alcanzable sin pasar por hoyos.
+            while True:
+                self.wumpus, self.oro = random.sample(libres, 2)
+                self.hoyos = {c for c in libres if c not in (self.wumpus, self.oro)
+                              and random.random() < 0.2}
+                if self._resoluble():
+                    break
         else:
             self.hoyos = {(3, 1), (3, 3), (4, 4)}
             self.wumpus, self.oro = (1, 3), (2, 3)
 
+    def _resoluble(self):
+        cola, vistos = deque([(1, 1)]), {(1, 1)}
+        while cola:
+            casilla = cola.popleft()
+            if casilla == self.oro:
+                return True
+            for vecina in vecinos(casilla):
+                if vecina not in vistos and vecina not in self.hoyos:
+                    vistos.add(vecina)
+                    cola.append(vecina)
+        return False
+
+    def letal(self, casilla):
+        """True si entrar a la casilla mata al agente (hoyo o Wumpus vivo)."""
+        return casilla in self.hoyos or casilla == self.wumpus
+
     def disparar(self, origen, objetivo):
-        dx = (objetivo[0] > origen[0]) - (objetivo[0] < origen[0])
-        dy = (objetivo[1] > origen[1]) - (objetivo[1] < origen[1])
+        dx = signo(objetivo[0] - origen[0])
+        dy = signo(objetivo[1] - origen[1])
         self.grito = False
-        if dx and dy:
+        if (dx and dy) or not (dx or dy):
             return 0
         x, y = origen
         while 1 <= x + dx <= N and 1 <= y + dy <= N:
@@ -62,52 +132,127 @@ class Agente:
         self.m = mundo
         self.pos = (1, 1)
         self.visitadas = {self.pos}
-        self.sin_hoyo = {self.pos}
-        self.sin_wumpus = {self.pos}
+        self.sin_hoyo = {self.pos}          # KB |= "no hay hoyo en c"
+        self.sin_wumpus = {self.pos}        # KB |= "no hay Wumpus en c"
+        self.hoyos_ciertos, self.hoyos_posibles = set(), set()
+        self.wumpus_posibles, self.wumpus_cierto = set(), None
+        self.n_modelos_hoyos = self.n_modelos_wumpus = 0
+        self.descartadas_w = set()          # lineas de flechas fallidas
         self.percepciones = {}
         self.puntaje, self.vivo, self.fin = 0, True, False
+        self.oro = False
         self.flecha, self.wumpus_muerto = True, False
+        # Cada entrada: (nivel, texto). nivel 0 = accion (siempre visible);
+        # nivel 1 = detalle del razonamiento KB (solo con "Ver razonamiento").
         self.log = []
-        self.tell()
+        self.tell(f"Inicio en {coord(self.pos)}")
 
-    def tell(self):
+    def anotar(self, texto, detalle=False):
+        self.log.append((1 if detalle else 0, texto))
+
+    # ------------------------------------------------------------------
+    # Base de conocimiento (KB) y model checking
+    # ------------------------------------------------------------------
+    def tell(self, accion=None):
+        """TELL: agrega la percepcion actual a la KB y recalcula las inferencias.
+
+        Si se pasa `accion`, se escribe una linea de bitacora normal del tipo
+        'Me muevo a (3,2) -1 · Brisa'.
+        """
         percepcion = self.m.percibir(self.pos)
         self.percepciones[self.pos] = percepcion
-        self.log.append(f"En {self.pos}: [S,B,G,Bu,Sc]={percepcion}")
-        self.sin_hoyo.add(self.pos)
-        self.sin_wumpus.add(self.pos)
-        for casilla in vecinos(self.pos):
-            if not percepcion[0]:
-                self.sin_wumpus.add(casilla)
-            if not percepcion[1]:
-                self.sin_hoyo.add(casilla)
-        if not percepcion[0] and not percepcion[1]:
-            self.log.append(f"  Sin hedor ni brisa: vecinas de {self.pos} seguras")
+        if accion:
+            self.anotar(f"{accion} · {texto_percepcion(percepcion)}")
+        self.anotar(f"En {coord(self.pos)}: [S,B,G,Bu,Sc]={percepcion}", detalle=True)
+        self.actualizar_kb()
+
+    def frontera(self):
+        """Casillas no visitadas vecinas de una visitada: las variables de la KB."""
+        return sorted({v for c in self.visitadas for v in vecinos(c)} - self.visitadas)
+
+    def modelos_hoyos(self, frontera):
+        """Tabla de verdad sobre P[x,y]; deja los modelos donde la KB es verdadera.
+
+        Regla:  B[c] <=> (hay hoyo en alguna vecina de c)
+        """
+        validos = []
+        for valores in product([False, True], repeat=len(frontera)):
+            hoyos = {c for c, v in zip(frontera, valores) if v}
+            if all(bool(hoyos & set(vecinos(c))) == bool(p[1])
+                   for c, p in self.percepciones.items()):
+                validos.append(hoyos)
+        return validos
+
+    def modelos_wumpus(self, frontera):
+        """Modelos sobre W[x,y] (a lo sumo un Wumpus) que hacen verdadera la KB.
+
+        Regla:  S[c] <=> (hay Wumpus en alguna vecina de c)
+        """
+        if self.wumpus_muerto:
+            return [set()]
+        validos = []
+        for w in [None] + frontera:
+            if w in self.descartadas_w:
+                continue
+            if all((w in vecinos(c)) == bool(p[0])
+                   for c, p in self.percepciones.items()):
+                validos.append({w} if w else set())
+        return validos
+
+    @staticmethod
+    def _describir(modelos, letra, nombre):
+        n = len(modelos)
+        texto = f"{n} modelo{'s' if n != 1 else ''} de {nombre}"
+        if 0 < n <= 6:
+            def fmt(m):
+                return "{" + ", ".join(f"{letra}{x}{y}" for x, y in sorted(m)) + "}"
+            texto += " -> " + "  ".join(fmt(m) for m in modelos)
+        return texto
+
+    def actualizar_kb(self):
+        antes = self.sin_hoyo & self.sin_wumpus
+        frontera = self.frontera()
+        mh = self.modelos_hoyos(frontera)
+        mw = self.modelos_wumpus(frontera)
+        if not mh or not mw:
+            self.anotar("KB inconsistente: se conservan las inferencias previas",
+                        detalle=True)
+            return
+        self.n_modelos_hoyos, self.n_modelos_wumpus = len(mh), len(mw)
+        self.anotar("KB: " + self._describir(mh, "P", "hoyos"), detalle=True)
+        self.anotar("KB: " + self._describir(mw, "W", "Wumpus"), detalle=True)
+
+        # KB |= "no hay hoyo en c"  <=>  c no tiene hoyo en NINGUN modelo.
+        self.sin_hoyo = set(self.visitadas) | {c for c in frontera
+                                               if all(c not in m for m in mh)}
+        self.sin_wumpus = set(self.visitadas) | {c for c in frontera
+                                                 if all(c not in m for m in mw)}
+        if self.wumpus_muerto:
+            self.sin_wumpus |= {(x, y) for x in range(1, N + 1)
+                                for y in range(1, N + 1)}
+        # Hoyo cierto: hay hoyo en TODOS los modelos. Posible: en AL MENOS uno.
+        self.hoyos_ciertos = {c for c in frontera if all(c in m for m in mh)}
+        self.hoyos_posibles = {c for c in frontera if any(c in m for m in mh)}
+        self.wumpus_posibles = set().union(*mw)
+        ciertos = [c for c in frontera if all(c in m for m in mw)]
+        self.wumpus_cierto = ciertos[0] if ciertos else None
+
+        nuevas = (self.sin_hoyo & self.sin_wumpus) - antes - self.visitadas
+        if nuevas and not self.wumpus_muerto:
+            self.anotar("KB |= seguras: " + ", ".join(coord(c) for c in sorted(nuevas)),
+                        detalle=True)
 
     def segura(self, casilla):
         return casilla in self.sin_hoyo and casilla in self.sin_wumpus
 
     def inferir(self):
-        hoyos_seguros, hoyos_posibles = set(), set()
-        for casilla, percepcion in self.percepciones.items():
-            if percepcion[1]:
-                candidatas = [vecina for vecina in vecinos(casilla)
-                              if vecina not in self.sin_hoyo]
-                hoyos_posibles.update(candidatas)
-                if len(candidatas) == 1:
-                    hoyos_seguros.add(candidatas[0])
+        """Devuelve (hoyos_ciertos, hoyos_posibles, wumpus_posibles, wumpus_cierto)."""
+        return (self.hoyos_ciertos, self.hoyos_posibles,
+                self.wumpus_posibles, self.wumpus_cierto)
 
-        wumpus_posibles = None
-        for casilla, percepcion in self.percepciones.items():
-            if percepcion[0]:
-                candidatas = {vecina for vecina in vecinos(casilla)
-                              if vecina not in self.sin_wumpus}
-                wumpus_posibles = (candidatas if wumpus_posibles is None
-                                   else wumpus_posibles & candidatas)
-        wumpus_posibles = wumpus_posibles or set()
-        wumpus_seguro = next(iter(wumpus_posibles)) if len(wumpus_posibles) == 1 else None
-        return hoyos_seguros, hoyos_posibles, wumpus_posibles, wumpus_seguro
-
+    # ------------------------------------------------------------------
+    # Planificacion de ruta y toma de decisiones
+    # ------------------------------------------------------------------
     def bfs(self, meta, se_puede_pasar):
         cola, vistos = deque([(self.pos, [])]), {self.pos}
         while cola:
@@ -122,70 +267,107 @@ class Agente:
                     cola.append((vecina, camino + [vecina]))
         return None
 
+    def objetivo_riesgo(self, hoyos_ciertos, hoyos_posibles, wumpus_posibles,
+                        wumpus_cierto):
+        """Casilla de la frontera con menos riesgo (hoyo posible + wumpus posible)."""
+        candidatas = {v for c in self.visitadas for v in vecinos(c)
+                      if v not in self.visitadas and v not in hoyos_ciertos
+                      and v != wumpus_cierto}
+        return min(sorted(candidatas),
+                   key=lambda c: (c in hoyos_posibles) + (c in wumpus_posibles),
+                   default=None)
+
     def paso(self):
         if not self.vivo or self.fin:
             return
         if self.percepciones[self.pos][2]:
             self.puntaje += 1000
+            self.oro = True
             self.fin = True
-            self.log.append("Brillo: agarro el oro (+1000)")
+            self.anotar("Brillo: agarro el oro +1000")
             return
 
-        hoyos_seguros, _, _, wumpus_seguro = self.inferir()
-        if self.flecha and wumpus_seguro and not self.wumpus_muerto:
-            if self.pos[0] == wumpus_seguro[0] or self.pos[1] == wumpus_seguro[1]:
-                return self.disparar(wumpus_seguro)
+        hoyos_ciertos, hoyos_posibles, wumpus_posibles, wumpus_cierto = self.inferir()
+
+        # 1) Wumpus localizado con certeza (KB |= W[x,y]): dispararle.
+        if self.flecha and wumpus_cierto and not self.wumpus_muerto:
+            if alineados(self.pos, wumpus_cierto):
+                return self.disparar(wumpus_cierto)
             camino = self.bfs(
-                lambda c: self.segura(c) and
-                (c[0] == wumpus_seguro[0] or c[1] == wumpus_seguro[1]),
+                lambda c: self.segura(c) and alineados(c, wumpus_cierto),
                 self.segura,
             )
             if camino:
-                self.log.append(f"Wumpus en {wumpus_seguro}: busco alinearme para disparar.")
+                self.anotar(f"Busco alinearme con el Wumpus {coord(wumpus_cierto)}")
                 return self.mover(camino[0])
 
+        # 2) Explorar casillas que la KB implica seguras.
         camino = self.bfs(
             lambda c: c not in self.visitadas and self.segura(c), self.segura,
         )
-        if not camino:
-            self.log.append("Sin casillas seguras nuevas: asumo un riesgo.")
+        if camino:
+            return self.mover(camino[0])
+
+        # 3) Sin casillas seguras y con hedor: disparar antes de apostar.
+        if self.flecha and not self.wumpus_muerto and wumpus_posibles:
+            for objetivo in sorted(wumpus_posibles):
+                if alineados(self.pos, objetivo):
+                    self.anotar("Sin casillas seguras: disparo a un posible Wumpus",
+                                detalle=True)
+                    return self.disparar(objetivo)
             camino = self.bfs(
-                lambda c: c not in self.visitadas and c not in hoyos_seguros
-                and c != wumpus_seguro,
+                lambda c: self.segura(c) and
+                any(alineados(c, w) for w in wumpus_posibles),
                 self.segura,
             )
+            if camino:
+                self.anotar("Sin casillas seguras: me alineo para disparar")
+                return self.mover(camino[0])
+
+        # 4) Apostar por la casilla menos riesgosa (la KB no implica que sea segura).
+        objetivo = self.objetivo_riesgo(hoyos_ciertos, hoyos_posibles,
+                                        wumpus_posibles, wumpus_cierto)
+        camino = (self.bfs(lambda c: c == objetivo, self.segura)
+                  if objetivo else None)
         if not camino:
-            self.log.append("Sin movimientos posibles.")
+            self.anotar("Sin movimientos posibles")
             self.fin = True
             return
+        self.anotar(f"Sin casillas seguras: arriesgo {coord(objetivo)}")
         self.mover(camino[0])
 
     def disparar(self, objetivo):
         self.flecha = False
         self.puntaje -= 10
-        grito = self.m.disparar(self.pos, objetivo)
-        self.log.append(f"Disparo desde {self.pos} hacia {objetivo} (-10)")
+        origen = self.pos
+        grito = self.m.disparar(origen, objetivo)
+        self.anotar(f"Disparo hacia {coord(objetivo)} -10")
         if grito:
             self.wumpus_muerto = True
-            self.sin_wumpus |= {(x, y) for x in range(1, N + 1)
-                                for y in range(1, N + 1)}
-        self.tell()
-        if grito:
-            self.log.append("Grito: el Wumpus murio; ya no hay peligro de Wumpus.")
+            self.anotar("Grito: Wumpus muerto")
         else:
-            self.log.append("Sin grito: la flecha fallo.")
+            # La flecha cruzo toda la linea sin grito: ahi no hay Wumpus (nueva
+            # observacion que entra a la KB).
+            dx, dy = signo(objetivo[0] - origen[0]), signo(objetivo[1] - origen[1])
+            x, y = origen
+            while (dx or dy) and 1 <= x + dx <= N and 1 <= y + dy <= N:
+                x, y = x + dx, y + dy
+                self.descartadas_w.add((x, y))
+            self.anotar("Sin grito: la flecha falló")
+        self.tell()
 
     def mover(self, casilla):
         self.pos = casilla
         self.puntaje -= 1
-        self.log.append(f"Me muevo a {self.pos} (-1)")
-        if self.pos in self.m.hoyos or self.pos == self.m.wumpus:
+        if self.m.letal(self.pos):
             self.vivo = False
             self.puntaje -= 1000
-            self.log.append("El agente murio (-1000)")
+            causa = "Hoyo" if self.pos in self.m.hoyos else "Wumpus"
+            self.anotar(f"Me muevo a {coord(self.pos)} -1 · {causa}: "
+                        f"el agente murió -1000")
             return
         self.visitadas.add(self.pos)
-        self.tell()
+        self.tell(f"Me muevo a {coord(self.pos)} -1")
 
 
 def main():
@@ -196,26 +378,31 @@ def main():
 
     root = tk.Tk()
     root.title("Wumpus | Agente lógico")
-    root.geometry("1180x820")
-    root.minsize(980, 720)
+    # La ventana nunca debe ser mas grande que la pantalla (si no, se corta
+    # el panel derecho o los botones de abajo).
+    ancho_ini = min(1180, root.winfo_screenwidth() - 40)
+    alto_ini = min(820, root.winfo_screenheight() - 90)
+    root.geometry(f"{ancho_ini}x{alto_ini}")
+    root.minsize(min(980, ancho_ini), min(720, alto_ini))
     root.configure(bg="#0b141b")
 
     style = ttk.Style(root)
     style.theme_use("clam")
     style.configure("Wumpus.Primary.TButton", font=("Segoe UI Semibold", 11),
-                    foreground="#162126", background="#e3bd72", padding=(18, 11),
+                    foreground="#162126", background="#e3bd72", padding=(18, 8),
                     borderwidth=0)
     style.map("Wumpus.Primary.TButton", background=[("active", "#f0ce87")])
     style.configure("Wumpus.Secondary.TButton", font=("Segoe UI Semibold", 10),
-                    foreground="#e4e9e5", background="#26363c", padding=(14, 9),
+                    foreground="#e4e9e5", background="#26363c", padding=(14, 8),
                     borderwidth=0)
     style.map("Wumpus.Secondary.TButton", background=[("active", "#35494f")])
     style.configure("Wumpus.TCheckbutton", font=("Segoe UI", 9), foreground="#e1e8e7",
                     background="#111c24", padding=5)
     style.map("Wumpus.TCheckbutton", background=[("active", "#111c24")])
 
-    estado = {"mundo": Mundo(), "agente": None, "automatico": False}
+    estado = {"mundo": Mundo(), "agente": None, "automatico": False, "after": None}
     mostrar_mundo = tk.BooleanVar(value=False)
+    mostrar_kb = tk.BooleanVar(value=False)   # bitacora detallada (razonamiento KB)
     assets_dir = Path(__file__).with_name("Imgs Wumpus")
     background_source = None
     logo_source = None
@@ -237,6 +424,7 @@ def main():
         pass
     sprite_cache = {}
     background_cache = {}
+    faltantes = set()
 
     home = tk.Frame(root, bg="#0b141b")
     game = tk.Frame(root, bg="#0b141b")
@@ -250,12 +438,24 @@ def main():
     history = tk.Text(game_canvas, wrap="word", bg="#0b141a", fg="#d3dedd",
                       insertbackground="#e4c47c", font=("Consolas", 9), bd=0,
                       padx=12, pady=10, relief="flat", state="disabled")
+    # Acciones: lineas cortas y legibles. Detalle KB: mas pequeno, con sangria
+    # francesa para que, si se parte, no se confunda con una accion.
+    history.tag_configure("accion", foreground="#e1e8e7", spacing3=3)
+    history.tag_configure("kb", foreground="#86a9a6", font=("Consolas", 8),
+                          lmargin1=16, lmargin2=28, spacing3=2)
     scrollbar = ttk.Scrollbar(game_canvas, orient="vertical", command=history.yview)
     history.configure(yscrollcommand=scrollbar.set)
     logo_photos = {"university": None, "wumpus": None}
 
+    def tamano(canvas):
+        """Tamano real del canvas (sin forzar un minimo mayor que la ventana)."""
+        w, h = canvas.winfo_width(), canvas.winfo_height()
+        return (w if w > 1 else ancho_ini), (h if h > 1 else alto_ini)
+
     def background_photo(size):
         if size not in background_cache:
+            if len(background_cache) >= 2:
+                background_cache.clear()  # evita acumular un fondo por cada resize
             if background_source is None:
                 gradient = Image.linear_gradient("L").resize(size)
                 image = ImageOps.colorize(gradient, black="#091218", white="#1b3038")
@@ -271,9 +471,15 @@ def main():
     def sprite_photo(filename, size, fit=False):
         key = (filename, size, fit)
         if key not in sprite_cache:
-            path = assets_dir / filename
-            with Image.open(path) as image:
-                sprite = image.convert("RGBA")
+            try:
+                with Image.open(assets_dir / filename) as image:
+                    sprite = image.convert("RGBA")
+            except OSError:
+                if filename not in faltantes:
+                    faltantes.add(filename)
+                    print(f"[aviso] Falta la imagen: {filename}")
+                sprite = Image.new("RGBA", size,
+                                   "#26363c" if fit else (0, 0, 0, 0))
             if fit:
                 sprite = ImageOps.fit(sprite, size, method=Image.Resampling.LANCZOS)
             else:
@@ -282,8 +488,7 @@ def main():
         return sprite_cache[key]
 
     def draw_home():
-        width = max(home_canvas.winfo_width(), 980)
-        height = max(home_canvas.winfo_height(), 720)
+        width, height = tamano(home_canvas)
         home_canvas.delete("scene")
         home_canvas.create_image(0, 0, anchor="nw",
                                  image=background_photo((width, height)), tags="scene")
@@ -343,7 +548,7 @@ def main():
                                 text="Explora la cueva. Interpreta las señales.\n"
                                      "Encuentra el oro y vuelve con vida.",
                                 font=("Segoe UI", 12), fill="#d4dfdc", justify="left",
-                                  tags="scene")
+                                tags="scene")
         credit_top = height * 0.555
         home_canvas.create_rectangle(text_x, credit_top, width * 0.88,
                                      credit_top + 132, fill="#111c22",
@@ -362,28 +567,40 @@ def main():
         home_canvas.coords(exit_window, width * 0.82, height * 0.82)
 
     def draw_game():
-        width = max(game_canvas.winfo_width(), 980)
-        height = max(game_canvas.winfo_height(), 720)
+        agent, world = estado["agente"], estado["mundo"]
+        if agent is None:
+            return
+        width, height = tamano(game_canvas)
         game_canvas.delete("scene")
+        if len(sprite_cache) > 120:
+            sprite_cache.clear()  # los items ya se borraron, es seguro liberar
         game_canvas.create_image(0, 0, anchor="nw",
                                  image=background_photo((width, height)), tags="scene")
         game_canvas.create_rectangle(0, 0, width, height, fill="#071117",
                                      stipple="gray50", outline="", tags="scene")
         game_canvas.create_rectangle(28, 20, width - 28, 108, fill="#101a21",
                                      outline="#354850", tags="scene")
-        agent, world = estado["agente"], estado["mundo"]
         game_canvas.create_text(50, 34, anchor="nw", text="MUNDO DEL WUMPUS",
                                 font=("Segoe UI Semibold", 21), fill="#edf0e8",
                                 tags="scene")
         game_canvas.create_text(52, 70, anchor="nw",
                                 text="AGENTE LÓGICO  /  EXPLORACIÓN",
                                 font=("Segoe UI", 9), fill="#9eafb1", tags="scene")
-        status = "DERROTADO" if not agent.vivo else "ORO RECUPERADO" if agent.fin else "EXPLORANDO"
+        if not agent.vivo:
+            status = "DERROTADO"
+        elif agent.oro:
+            status = "ORO RECUPERADO"
+        elif agent.fin:
+            status = "SIN SALIDA"
+        else:
+            status = "EXPLORANDO"
         metrics = [("PUNTAJE", str(agent.puntaje)), ("ESTADO", status),
                    ("FLECHA", "DISPONIBLE" if agent.flecha else "USADA")]
+        box_w, gap = 150, 8
+        start = width - 28 - 14 - (3 * box_w + 2 * gap)
         for index, (label, value) in enumerate(metrics):
-            left = width - 370 + index * 112
-            game_canvas.create_rectangle(left, 32, left + 104, 92,
+            left = start + index * (box_w + gap)
+            game_canvas.create_rectangle(left, 32, left + box_w, 92,
                                          fill="#18262e", outline="#3b4d53",
                                          tags="scene")
             game_canvas.create_text(left + 10, 41, anchor="nw", text=label,
@@ -393,19 +610,33 @@ def main():
                                     fill="#e5c276" if index == 0 else "#e1e8e7",
                                     tags="scene")
 
-        cell_size = max(88, min(140, (height - 320) / N, (width * 0.48) / N))
+        # --- Layout: el tablero se encoge si hace falta para que el panel
+        # derecho (bitacora) SIEMPRE quepa dentro de la ventana. ---
+        board_x, board_y = 46, 170
+        sidebar_gap, right_margin, min_sidebar = 38, 40, 340
+        cell_size = min(140,
+                        (height - 300) / N,
+                        (width - board_x - sidebar_gap - right_margin - min_sidebar) / N)
+        cell_size = max(cell_size, 64)
         board_size = cell_size * N
-        board_x, board_y = 46, 218
-        game_canvas.create_text(board_x, board_y - 31, anchor="nw",
-                                text="MAPA DE EXPLORACIÓN",
-                                font=("Segoe UI Semibold", 11), fill="#e7ece8",
-                                tags="scene")
+
+        reveal = mostrar_mundo.get() or agent.fin or not agent.vivo
+        if reveal:
+            game_canvas.create_text(board_x, board_y - 31, anchor="nw",
+                                    text="MAPA  ·  MUNDO REAL REVELADO",
+                                    font=("Segoe UI Semibold", 11), fill="#b9a6f0",
+                                    tags="scene")
+        else:
+            game_canvas.create_text(board_x, board_y - 31, anchor="nw",
+                                    text="MAPA DE EXPLORACIÓN",
+                                    font=("Segoe UI Semibold", 11), fill="#e7ece8",
+                                    tags="scene")
         game_canvas.create_rectangle(board_x - 7, board_y - 7,
                                      board_x + board_size + 7,
                                      board_y + board_size + 7, fill="#101a21",
-                                     outline="#465961", tags="scene")
+                                     outline="#9b86d9" if reveal else "#465961",
+                                     tags="scene")
         pits, possible_pits, possible_wumpus, certain_wumpus = agent.inferir()
-        reveal = mostrar_mundo.get() or agent.fin or not agent.vivo
         floor_sprites = (
             "Casilla 1.png",
             "casilla 2 medio quebrada.png",
@@ -437,43 +668,52 @@ def main():
                     outline, label = "#354850", ""
 
                 sprite = None
+                real_only = False   # contenido tomado del mundo real, no deducido
                 if reveal:
                     if cell in world.hoyos:
-                        sprite = "hoyo revelado.png"
-                        label = "HOYO"
+                        sprite, label = "hoyo revelado.png", "HOYO"
+                        real_only = cell not in pits
                     elif cell == world.wumpus:
-                        sprite = "wumpus revelado.png"
-                        label = "WUMPUS"
+                        sprite, label = "wumpus revelado.png", "WUMPUS"
+                        real_only = cell != certain_wumpus
+                    elif cell == world.oro:
+                        sprite, label = "cofre brillante.png", "ORO"
+                        real_only = cell not in agent.visitadas
+                if sprite is None:
+                    if cell in pits:
+                        sprite, label = "hoyo revelado.png", "HOYO"
+                    elif cell == certain_wumpus:
+                        sprite, label = "wumpus escondido.png", "WUMPUS?"
+                    elif cell in possible_wumpus:
+                        sprite, label = "wumpus escondido.png", "W?"
                     elif cell == world.oro and cell in agent.visitadas:
-                        sprite = "cofre brillante.png"
-                        label = "ORO"
-                elif cell in pits:
-                    sprite, label = "hoyo revelado.png", "HOYO"
-                elif cell == certain_wumpus:
-                    sprite, label = "wumpus escondido.png", "WUMPUS?"
-                elif cell in possible_wumpus:
-                    sprite, label = "wumpus escondido.png", "W?"
-
-                if cell == world.oro and (reveal or cell in agent.visitadas):
-                    sprite, label = "cofre brillante.png", "ORO"
+                        sprite, label = "cofre brillante.png", "ORO"
 
                 tile = floor_sprites[(x + 2 * y) % len(floor_sprites)]
                 tile_photo = sprite_photo(tile, (int(cell_size - 6), int(cell_size - 6)), fit=True)
                 game_canvas.create_image((left + right) / 2, (top + bottom) / 2,
                                          image=tile_photo, tags="scene")
-                game_canvas.create_rectangle(left + 3, top + 3, right - 3, bottom - 3,
-                                             fill="", outline=outline,
-                                             width=3 if cell == agent.pos else 2,
-                                             tags="scene")
-                game_canvas.create_text(left + 11, top + 9, anchor="nw",
-                                        text=f"{x}, {y}", font=("Segoe UI", 8),
-                                        fill="#a6b5b5", tags="scene")
+                if real_only:
+                    # Violeta punteado = lo ve el jugador porque el mundo esta
+                    # revelado, pero el agente NO lo habia deducido.
+                    game_canvas.create_rectangle(left + 3, top + 3, right - 3,
+                                                 bottom - 3, fill="",
+                                                 outline="#9b86d9", width=3,
+                                                 dash=(7, 4), tags="scene")
+                else:
+                    game_canvas.create_rectangle(left + 3, top + 3, right - 3,
+                                                 bottom - 3, fill="",
+                                                 outline=outline,
+                                                 width=3 if cell == agent.pos else 2,
+                                                 tags="scene")
                 if sprite:
                     icon_size = int(cell_size * 0.65)
                     icon = sprite_photo(sprite, (icon_size, icon_size))
                     game_canvas.create_image((left + right) / 2,
                                              (top + bottom) / 2 - 5,
                                              image=icon, tags="scene")
+                if real_only:
+                    label = f"{label} · REAL"
                 if cell == agent.pos:
                     explorer_size = int(cell_size * 0.52)
                     explorer = sprite_photo("explorador.png",
@@ -482,6 +722,12 @@ def main():
                                              (top + bottom) / 2 - 5,
                                              image=explorer, tags="scene")
                     label = "AGENTE" if not label else "AGENTE / " + label
+                # Coordenadas con fondo oscuro para que se lean sobre cualquier tile.
+                game_canvas.create_rectangle(left + 6, top + 6, left + 46, top + 23,
+                                             fill="#101a21", outline="", tags="scene")
+                game_canvas.create_text(left + 11, top + 8, anchor="nw",
+                                        text=f"{x}, {y}", font=("Segoe UI", 8),
+                                        fill="#c3d0cf", tags="scene")
                 if label:
                     game_canvas.create_rectangle(left + 7, bottom - 22,
                                                  right - 7, bottom - 4,
@@ -490,82 +736,123 @@ def main():
                     game_canvas.create_text((left + right) / 2, bottom - 13,
                                             text=label,
                                             font=("Segoe UI Semibold", 8),
-                                            fill="#f0eadb", width=cell_size - 16,
+                                            fill="#d9ccff" if real_only else "#f0eadb",
+                                            width=cell_size - 16,
                                             tags="scene")
 
-        sidebar_x = board_x + board_size + 38
-        sidebar_width = width - sidebar_x - 40
-        game_canvas.create_rectangle(sidebar_x, 206, sidebar_x + sidebar_width, 356,
-                                     fill="#101a21", outline="#354850", tags="scene")
-        game_canvas.create_text(sidebar_x + 16, 220, anchor="nw",
+        legend = "HEDOR: Wumpus cerca   /   BRISA: hoyo cerca   /   BRILLO: oro"
+        if reveal:
+            legend += ("\nBorde violeta punteado (REAL): contenido del mundo real "
+                       "que el agente no había deducido.")
+        game_canvas.create_text(board_x, board_y + board_size + 16, anchor="nw",
+                                text=legend, font=("Segoe UI", 8),
+                                fill="#bac8c6", width=board_size, tags="scene")
+
+        # --- Panel derecho: nunca se sale de la ventana. ---
+        sidebar_x = board_x + board_size + sidebar_gap
+        sidebar_width = max(width - sidebar_x - right_margin, 260)
+        text_w = sidebar_width - 32
+        panel_top = board_y - 12
+        game_canvas.create_rectangle(sidebar_x, panel_top, sidebar_x + sidebar_width,
+                                     panel_top + 150, fill="#101a21",
+                                     outline="#354850", tags="scene")
+        game_canvas.create_text(sidebar_x + 16, panel_top + 14, anchor="nw",
                                 text="ESTADO DEL AGENTE",
                                 font=("Segoe UI Semibold", 11), fill="#e7ece8",
                                 tags="scene")
-        game_canvas.create_text(sidebar_x + 16, 250, anchor="nw",
+        game_canvas.create_text(sidebar_x + 16, panel_top + 44, anchor="nw",
                                 text=f"POSICIÓN   {agent.pos[0]}, {agent.pos[1]}"
                                      f"     VISITADAS   {len(agent.visitadas)}",
-                                font=("Segoe UI", 9), fill="#bdccca", tags="scene")
+                                font=("Segoe UI", 9), fill="#bdccca", width=text_w,
+                                tags="scene")
         perception = agent.percepciones.get(agent.pos, [0, 0, 0, 0, 0])
-        names = ("HEDOR", "BRISA", "BRILLO", "GOLPE", "GRITO")
-        active = [name for name, value in zip(names, perception) if value]
+        active = [name.upper() for name, value in zip(NOMBRES_PERCEPCION, perception)
+                  if value]
         sensors = "  /  ".join(active) if active else "SIN SEÑALES"
-        game_canvas.create_text(sidebar_x + 16, 285, anchor="nw",
+        game_canvas.create_text(sidebar_x + 16, panel_top + 79, anchor="nw",
                                 text="PERCEPCIÓN ACTUAL",
                                 font=("Segoe UI Semibold", 8), fill="#8fa5a7",
                                 tags="scene")
-        game_canvas.create_text(sidebar_x + 16, 304, anchor="nw", text=sensors,
-                                font=("Segoe UI Semibold", 10), fill="#e5c276",
+        game_canvas.create_text(sidebar_x + 16, panel_top + 98, anchor="nw",
+                                text=sensors, font=("Segoe UI Semibold", 10),
+                                fill="#e5c276", width=text_w, tags="scene")
+        game_canvas.create_text(sidebar_x + 16, panel_top + 126, anchor="nw",
+                                text=f"KB: {agent.n_modelos_hoyos} modelos de hoyos"
+                                     f" / {agent.n_modelos_wumpus} de Wumpus",
+                                font=("Segoe UI", 9), fill="#bdccca", width=text_w,
                                 tags="scene")
-        log_y, log_height = 375, height - 465
+        log_y = panel_top + 170
+        log_height = max(height - 90 - log_y, 120)
         game_canvas.create_rectangle(sidebar_x, log_y, sidebar_x + sidebar_width,
                                      log_y + log_height, fill="#101a21",
                                      outline="#354850", tags="scene")
         game_canvas.create_text(sidebar_x + 16, log_y + 12, anchor="nw",
                                 text="BITÁCORA", font=("Segoe UI Semibold", 11),
                                 fill="#e7ece8", tags="scene")
+        if mostrar_kb.get():
+            game_canvas.create_text(sidebar_x + sidebar_width - 16, log_y + 15,
+                                    anchor="ne", text="RAZONAMIENTO KB ACTIVADO",
+                                    font=("Segoe UI", 8), fill="#86a9a6",
+                                    tags="scene")
         game_canvas.coords(history_window, sidebar_x + 10, log_y + 42)
         game_canvas.itemconfigure(history_window, width=sidebar_width - 36,
                                   height=log_height - 52)
         game_canvas.coords(scrollbar_window, sidebar_x + sidebar_width - 23, log_y + 42)
         game_canvas.itemconfigure(scrollbar_window, height=log_height - 52)
+
+        # Bitacora: nivel 0 (acciones) siempre; nivel 1 (KB) solo si se pide.
+        detalle = mostrar_kb.get()
+        lineas = [(n, t) for n, t in agent.log if detalle or n == 0][-150:]
         history.configure(state="normal")
         history.delete("1.0", "end")
-        history.insert("end", "\n".join(agent.log[-80:]))
+        for nivel, texto in lineas:
+            history.insert("end", texto + "\n", "kb" if nivel else "accion")
         history.configure(state="disabled")
         history.see("end")
-        game_canvas.create_text(board_x, board_y + board_size + 20, anchor="nw",
-                                text="HEDOR: Wumpus cerca   /   BRISA: hoyo cerca   /   BRILLO: oro",
-                                font=("Segoe UI", 8), fill="#bac8c6", tags="scene")
 
-        total = sum(width for _, width in game_controls) + 7 * (len(game_controls) - 1)
-        control_x = (width - total) / 2
+        total = sum(w for _, w in game_controls) + 7 * (len(game_controls) - 1)
+        control_x = max((width - total) / 2, 8)
         for window, (_, control_width) in zip(game_windows, game_controls):
-            game_canvas.coords(window, control_x + control_width / 2, height - 37)
-            game_canvas.itemconfigure(window, width=control_width, height=38)
+            game_canvas.coords(window, control_x + control_width / 2, height - 40)
+            game_canvas.itemconfigure(window, width=control_width, height=44)
             control_x += control_width + 7
 
     def step_once():
         estado["agente"].paso()
         draw_game()
 
+    def stop_auto():
+        estado["automatico"] = False
+        if estado["after"] is not None:
+            root.after_cancel(estado["after"])
+            estado["after"] = None
+        auto_button.configure(text="Automático")
+
     def automatic_tick():
+        estado["after"] = None
         agent = estado["agente"]
-        if estado["automatico"] and agent.vivo and not agent.fin:
-            step_once()
-            root.after(650, automatic_tick)
+        if not estado["automatico"] or not agent.vivo or agent.fin:
+            stop_auto()
+            return
+        step_once()
+        if agent.vivo and not agent.fin:
+            estado["after"] = root.after(650, automatic_tick)
         else:
-            estado["automatico"] = False
-            auto_button.configure(text="Automático")
+            stop_auto()
 
     def toggle_auto():
-        estado["automatico"] = not estado["automatico"]
-        auto_button.configure(text="Pausar" if estado["automatico"] else "Automático")
         if estado["automatico"]:
-            automatic_tick()
+            stop_auto()
+            return
+        agent = estado["agente"]
+        if not agent.vivo or agent.fin:
+            return
+        estado["automatico"] = True
+        auto_button.configure(text="Pausar")
+        automatic_tick()
 
     def reset_game(aleatorio=False):
-        estado["automatico"] = False
-        auto_button.configure(text="Automático")
+        stop_auto()
         estado["mundo"] = Mundo(aleatorio)
         estado["agente"] = Agente(estado["mundo"])
         draw_game()
@@ -578,7 +865,7 @@ def main():
         draw_game()
 
     def return_home():
-        estado["automatico"] = False
+        stop_auto()
         game.place_forget()
         home.place(relwidth=1, relheight=1)
         home.lift()
@@ -606,6 +893,9 @@ def main():
                     command=return_home), 82),
         (ttk.Checkbutton(game_canvas, text="Ver mundo real", variable=mostrar_mundo,
                          style="Wumpus.TCheckbutton", command=draw_game), 136),
+        (ttk.Checkbutton(game_canvas, text="Ver razonamiento (KB)",
+                         variable=mostrar_kb, style="Wumpus.TCheckbutton",
+                         command=draw_game), 188),
     ]
     game_windows = [game_canvas.create_window(0, 0, window=widget)
                     for widget, _ in game_controls]
