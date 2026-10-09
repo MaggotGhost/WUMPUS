@@ -70,9 +70,17 @@ def texto_percepcion(p):
 class Mundo:
     """Entorno real: el agente no ve directamente sus contenidos."""
 
-    def __init__(self, aleatorio=False):
+    def __init__(self, aleatorio=False, sin_salida=False):
+        if aleatorio and sin_salida:
+            raise ValueError("El mundo aleatorio y el caso sin salida son excluyentes.")
+
         self.grito = False
-        if aleatorio:
+        if sin_salida:
+            self.nombre = "Caso sin salida"
+            self.hoyos = {(2, 1), (1, 2)}
+            self.wumpus, self.oro = (4, 4), (4, 3)
+        elif aleatorio:
+            self.nombre = "Mundo aleatorio"
             libres = [(x, y) for x in range(1, N + 1) for y in range(1, N + 1)
                       if (x, y) != (1, 1)]
             # Se regenera hasta que el oro sea alcanzable sin pasar por hoyos.
@@ -83,6 +91,7 @@ class Mundo:
                 if self._resoluble():
                     break
         else:
+            self.nombre = "Mundo clásico"
             self.hoyos = {(3, 1), (3, 3), (4, 4)}
             self.wumpus, self.oro = (1, 3), (2, 3)
 
@@ -93,7 +102,8 @@ class Mundo:
             if casilla == self.oro:
                 return True
             for vecina in vecinos(casilla):
-                if vecina not in vistos and vecina not in self.hoyos:
+                if (vecina not in vistos and vecina not in self.hoyos
+                        and vecina != self.wumpus):
                     vistos.add(vecina)
                     cola.append(vecina)
         return False
@@ -280,11 +290,27 @@ class Agente:
     def paso(self):
         if not self.vivo or self.fin:
             return
+
+        if self.oro:
+            if self.pos == (1, 1):
+                self.puntaje += 1000
+                self.fin = True
+                self.anotar("Regreso a la salida con el oro: escapo +1000")
+                return
+            camino = self.bfs(
+                lambda c: c == (1, 1),
+                lambda c: c in self.visitadas and self.segura(c),
+            )
+            if camino:
+                return self.mover(camino[0])
+            self.fin = True
+            self.anotar("Tengo el oro, pero no hay ruta segura de regreso")
+            return
+
         if self.percepciones[self.pos][2]:
             self.puntaje += 1000
             self.oro = True
-            self.fin = True
-            self.anotar("Brillo: agarro el oro +1000")
+            self.anotar("Brillo: agarro el oro +1000; regreso a la salida")
             return
 
         hoyos_ciertos, hoyos_posibles, wumpus_posibles, wumpus_cierto = self.inferir()
@@ -361,6 +387,7 @@ class Agente:
         self.puntaje -= 1
         if self.m.letal(self.pos):
             self.vivo = False
+            self.fin = True
             self.puntaje -= 1000
             causa = "Hoyo" if self.pos in self.m.hoyos else "Wumpus"
             self.anotar(f"Me muevo a {coord(self.pos)} -1 · {causa}: "
@@ -584,12 +611,16 @@ def main():
                                 font=("Segoe UI Semibold", 21), fill="#edf0e8",
                                 tags="scene")
         game_canvas.create_text(52, 70, anchor="nw",
-                                text="AGENTE LÓGICO  /  EXPLORACIÓN",
+                                text=f"AGENTE LÓGICO  /  {world.nombre.upper()}",
                                 font=("Segoe UI", 9), fill="#9eafb1", tags="scene")
         if not agent.vivo:
             status = "DERROTADO"
+        elif agent.fin and agent.oro and agent.pos == (1, 1):
+            status = "ESCAPÓ CON ORO"
+        elif agent.fin and agent.oro:
+            status = "ORO, SIN REGRESO"
         elif agent.oro:
-            status = "ORO RECUPERADO"
+            status = "REGRESANDO CON ORO"
         elif agent.fin:
             status = "SIN SALIDA"
         else:
@@ -851,9 +882,9 @@ def main():
         auto_button.configure(text="Pausar")
         automatic_tick()
 
-    def reset_game(aleatorio=False):
+    def reset_game(aleatorio=False, sin_salida=False):
         stop_auto()
-        estado["mundo"] = Mundo(aleatorio)
+        estado["mundo"] = Mundo(aleatorio=aleatorio, sin_salida=sin_salida)
         estado["agente"] = Agente(estado["mundo"])
         draw_game()
 
@@ -880,15 +911,32 @@ def main():
 
     auto_button = ttk.Button(game_canvas, text="Automático",
                              style="Wumpus.Secondary.TButton", command=toggle_auto)
+    world_menu = tk.Menu(root, tearoff=False)
+    world_menu.add_command(label="Mundo clásico", command=reset_game)
+    world_menu.add_command(
+        label="Mundo aleatorio",
+        command=lambda: reset_game(aleatorio=True),
+    )
+    world_menu.add_command(
+        label="Caso sin salida",
+        command=lambda: reset_game(sin_salida=True),
+    )
+
+    def show_world_menu():
+        try:
+            world_menu.tk_popup(root.winfo_pointerx(), root.winfo_pointery())
+        finally:
+            world_menu.grab_release()
+
     game_controls = [
         (ttk.Button(game_canvas, text="Un paso", style="Wumpus.Primary.TButton",
                     command=step_once), 94),
         (auto_button, 116),
         (ttk.Button(game_canvas, text="Reiniciar", style="Wumpus.Secondary.TButton",
                     command=reset_game), 102),
-        (ttk.Button(game_canvas, text="Mundo aleatorio",
+        (ttk.Button(game_canvas, text="Escenarios",
                     style="Wumpus.Secondary.TButton",
-                    command=lambda: reset_game(True)), 140),
+                    command=show_world_menu), 120),
         (ttk.Button(game_canvas, text="Inicio", style="Wumpus.Secondary.TButton",
                     command=return_home), 82),
         (ttk.Checkbutton(game_canvas, text="Ver mundo real", variable=mostrar_mundo,
