@@ -16,8 +16,9 @@ Como razona el agente (lo visto en clase)
 * Si alfa es falsa en al menos un modelo, KB no implica alfa: la casilla es
   solo "posible" (incierta).
 
-El BFS se usa unicamente como planificador de ruta: una vez la KB decide
-cuales casillas son seguras, calcula el camino mas corto por ellas.
+El agente elige entre las casillas seguras adyacentes que implica la KB.
+Cuando necesita volver, sigue en reversa el recorrido que ya hizo; no busca
+rutas alternativas.
 
 Bitacora
 --------
@@ -34,7 +35,6 @@ Tiene dos niveles:
 ##DANNA SOLER
 
 import random
-from collections import deque
 from itertools import product
 
 N = 4
@@ -83,30 +83,13 @@ class Mundo:
             self.nombre = "Mundo aleatorio"
             libres = [(x, y) for x in range(1, N + 1) for y in range(1, N + 1)
                       if (x, y) != (1, 1)]
-            # Se regenera hasta que el oro sea alcanzable sin pasar por hoyos.
-            while True:
-                self.wumpus, self.oro = random.sample(libres, 2)
-                self.hoyos = {c for c in libres if c not in (self.wumpus, self.oro)
-                              and random.random() < 0.2}
-                if self._resoluble():
-                    break
+            self.wumpus, self.oro = random.sample(libres, 2)
+            self.hoyos = {c for c in libres if c not in (self.wumpus, self.oro)
+                          and random.random() < 0.2}
         else:
             self.nombre = "Mundo clásico"
             self.hoyos = {(3, 1), (3, 3), (4, 4)}
             self.wumpus, self.oro = (1, 3), (2, 3)
-
-    def _resoluble(self):
-        cola, vistos = deque([(1, 1)]), {(1, 1)}
-        while cola:
-            casilla = cola.popleft()
-            if casilla == self.oro:
-                return True
-            for vecina in vecinos(casilla):
-                if (vecina not in vistos and vecina not in self.hoyos
-                        and vecina != self.wumpus):
-                    vistos.add(vecina)
-                    cola.append(vecina)
-        return False
 
     def letal(self, casilla):
         """True si entrar a la casilla mata al agente (hoyo o Wumpus vivo)."""
@@ -142,6 +125,7 @@ class Agente:
         self.m = mundo
         self.pos = (1, 1)
         self.visitadas = {self.pos}
+        self.recorrido = [self.pos]
         self.sin_hoyo = {self.pos}          # KB |= "no hay hoyo en c"
         self.sin_wumpus = {self.pos}        # KB |= "no hay Wumpus en c"
         self.hoyos_ciertos, self.hoyos_posibles = set(), set()
@@ -261,31 +245,24 @@ class Agente:
                 self.wumpus_posibles, self.wumpus_cierto)
 
     # ------------------------------------------------------------------
-    # Planificacion de ruta y toma de decisiones
+    # Toma de decisiones locales basada en la KB
     # ------------------------------------------------------------------
-    def bfs(self, meta, se_puede_pasar):
-        cola, vistos = deque([(self.pos, [])]), {self.pos}
-        while cola:
-            casilla, camino = cola.popleft()
-            for vecina in vecinos(casilla):
-                if vecina in vistos:
-                    continue
-                vistos.add(vecina)
-                if meta(vecina):
-                    return camino + [vecina]
-                if se_puede_pasar(vecina):
-                    cola.append((vecina, camino + [vecina]))
-        return None
-
     def objetivo_riesgo(self, hoyos_ciertos, hoyos_posibles, wumpus_posibles,
                         wumpus_cierto):
-        """Casilla de la frontera con menos riesgo (hoyo posible + wumpus posible)."""
-        candidatas = {v for c in self.visitadas for v in vecinos(c)
-                      if v not in self.visitadas and v not in hoyos_ciertos
-                      and v != wumpus_cierto}
+        """Vecina menos riesgosa segun los modelos actuales de la KB."""
+        candidatas = {v for v in vecinos(self.pos) if v not in self.visitadas
+                      and v not in hoyos_ciertos and v != wumpus_cierto}
         return min(sorted(candidatas),
                    key=lambda c: (c in hoyos_posibles) + (c in wumpus_posibles),
                    default=None)
+
+    def retroceder(self):
+        """Vuelve una casilla por el recorrido seguro, sin buscar otra ruta."""
+        if len(self.recorrido) <= 1:
+            return False
+        anterior = self.recorrido[-2]
+        self.mover(anterior, retroceso=True)
+        return True
 
     def paso(self):
         if not self.vivo or self.fin:
@@ -297,14 +274,10 @@ class Agente:
                 self.fin = True
                 self.anotar("Regreso a la salida con el oro: escapo +1000")
                 return
-            camino = self.bfs(
-                lambda c: c == (1, 1),
-                lambda c: c in self.visitadas and self.segura(c),
-            )
-            if camino:
-                return self.mover(camino[0])
+            if self.retroceder():
+                return
             self.fin = True
-            self.anotar("Tengo el oro, pero no hay ruta segura de regreso")
+            self.anotar("Tengo el oro, pero no hay recorrido seguro de regreso")
             return
 
         if self.percepciones[self.pos][2]:
@@ -319,20 +292,12 @@ class Agente:
         if self.flecha and wumpus_cierto and not self.wumpus_muerto:
             if alineados(self.pos, wumpus_cierto):
                 return self.disparar(wumpus_cierto)
-            camino = self.bfs(
-                lambda c: self.segura(c) and alineados(c, wumpus_cierto),
-                self.segura,
-            )
-            if camino:
-                self.anotar(f"Busco alinearme con el Wumpus {coord(wumpus_cierto)}")
-                return self.mover(camino[0])
 
-        # 2) Explorar casillas que la KB implica seguras.
-        camino = self.bfs(
-            lambda c: c not in self.visitadas and self.segura(c), self.segura,
-        )
-        if camino:
-            return self.mover(camino[0])
+        # 2) Avanzar solo a una vecina que la KB implica segura.
+        seguras_adyacentes = [c for c in vecinos(self.pos)
+                              if c not in self.visitadas and self.segura(c)]
+        if seguras_adyacentes:
+            return self.mover(sorted(seguras_adyacentes)[0])
 
         # 3) Sin casillas seguras y con hedor: disparar antes de apostar.
         if self.flecha and not self.wumpus_muerto and wumpus_posibles:
@@ -341,26 +306,20 @@ class Agente:
                     self.anotar("Sin casillas seguras: disparo a un posible Wumpus",
                                 detalle=True)
                     return self.disparar(objetivo)
-            camino = self.bfs(
-                lambda c: self.segura(c) and
-                any(alineados(c, w) for w in wumpus_posibles),
-                self.segura,
-            )
-            if camino:
-                self.anotar("Sin casillas seguras: me alineo para disparar")
-                return self.mover(camino[0])
 
-        # 4) Apostar por la casilla menos riesgosa (la KB no implica que sea segura).
+        # 4) Agotar el recorrido conocido antes de asumir un riesgo nuevo.
+        if self.retroceder():
+            return
+
+        # 5) Sin mas casillas seguras, arriesgarse en una vecina posible.
         objetivo = self.objetivo_riesgo(hoyos_ciertos, hoyos_posibles,
                                         wumpus_posibles, wumpus_cierto)
-        camino = (self.bfs(lambda c: c == objetivo, self.segura)
-                  if objetivo else None)
-        if not camino:
+        if objetivo is None:
             self.anotar("Sin movimientos posibles")
             self.fin = True
             return
         self.anotar(f"Sin casillas seguras: arriesgo {coord(objetivo)}")
-        self.mover(camino[0])
+        self.mover(objetivo)
 
     def disparar(self, objetivo):
         self.flecha = False
@@ -382,7 +341,7 @@ class Agente:
             self.anotar("Sin grito: la flecha falló")
         self.tell()
 
-    def mover(self, casilla):
+    def mover(self, casilla, retroceso=False):
         self.pos = casilla
         self.puntaje -= 1
         if self.m.letal(self.pos):
@@ -393,6 +352,10 @@ class Agente:
             self.anotar(f"Me muevo a {coord(self.pos)} -1 · {causa}: "
                         f"el agente murió -1000")
             return
+        if retroceso:
+            self.recorrido.pop()
+        else:
+            self.recorrido.append(self.pos)
         self.visitadas.add(self.pos)
         self.tell(f"Me muevo a {coord(self.pos)} -1")
 

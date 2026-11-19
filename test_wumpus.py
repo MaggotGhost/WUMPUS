@@ -10,7 +10,11 @@ class MundoTests(unittest.TestCase):
         for _ in range(100):
             if not agent.vivo or agent.fin:
                 break
+            anterior = agent.pos
             agent.paso()
+            if agent.pos != anterior:
+                distancia = sum(abs(a - b) for a, b in zip(anterior, agent.pos))
+                self.assertEqual(distancia, 1)
 
         self.assertTrue(agent.oro)
         self.assertTrue(agent.vivo)
@@ -23,7 +27,6 @@ class MundoTests(unittest.TestCase):
         exits = set(vecinos((1, 1)))
 
         self.assertEqual(exits, world.hoyos)
-        self.assertFalse(world._resoluble())
 
         agent = Agente(world)
         agent.paso()
